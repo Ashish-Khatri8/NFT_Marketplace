@@ -50,12 +50,9 @@ contract MarketPlace is Ownable, ReentrancyGuard {
     ) {
 
         require(
-            address(_tokenAddress) != address(0),
-            "Marketplace: ERC20 token address cannot be null address."
-        );
-        require(
+            address(_tokenAddress) != address(0) &&
             address(_nftAddress) != address(0),
-            "Marketplace: NFT token address cannot be null address."
+            "Marketplace: ERC20 and NFT contract address cannot be null address."
         );
         require(
             address(_nftAddress) != address(_tokenAddress),
@@ -82,34 +79,17 @@ contract MarketPlace is Ownable, ReentrancyGuard {
         uint256 _price,
         uint256 _royaltyPercentage
     ) public {
-        require(
-            nftContract.ownerOf(_tokenId) == msg.sender ||
-            nftContract.getApproved(_tokenId) == msg.sender,
-            "Marketplace: You are not authorized to list this NFT."
-        );
-        require(
-            _price > 0,
-            "Marketplace: NFT price must be greater than 0."
-        );
-        require(
-            _royaltyPercentage >= 0 &&
-            _royaltyPercentage < 31,
-            "Marketplace: Royalty Percentage must be between 0 and 30%."
-        );
-
-        //  Update previous owner.
-        NFT_Owner memory previousOwner = nftListings[_tokenId].owner;
         
-        // Create new owner object.
-        NFT_Owner memory owner = NFT_Owner(
-            payable(nftContract.ownerOf(_tokenId)),
-            _royaltyPercentage
-        );
+        preListingValidation(_tokenId, _price, _royaltyPercentage);
+        
+        // Update new owner.
+        nftListings[_tokenId].owner.addr = payable(nftContract.ownerOf(_tokenId));
+        nftListings[_tokenId].owner.royaltyPercentage = _royaltyPercentage;
 
         // Create new nft item.
         NFT_Item memory newItem = NFT_Item(
-            previousOwner,
-            owner,
+            nftListings[_tokenId].previousOwner,
+            nftListings[_tokenId].owner,
             payable(msg.sender),
             _tokenId,
             _price,
@@ -127,31 +107,49 @@ contract MarketPlace is Ownable, ReentrancyGuard {
     }
 
     function buyNFT(uint256 _tokenId) external payable {
-        require(
-            nftListings[_tokenId].isListed == true,
-            "Marketplace: NFT with given id is not available for sale."
-        );
-        require(
-            nftListings[_tokenId].owner.addr != msg.sender &&
-            nftListings[_tokenId].seller != msg.sender,
-            "Marketplace: Cannot buy your own NFT."
-        );
-        require(
-            tokenContract.allowance(msg.sender, address(this)) >= nftListings[_tokenId].price,
-            "Marketplace: Unsufficient token allowance."
-        );
+        preSaleValidation(_tokenId);
+        NFT_Owner memory ownerBeforeSale = nftListings[_tokenId].owner;
 
-        // Calculate royalties and platform fees.
         uint256 nftPrice = nftListings[_tokenId].price;
-        uint256 platformFees = (25 * nftPrice) / 1000; // 2.5%
+        makeTokenPayments(_tokenId, nftPrice);
 
-        // ROyalties for previous owner.
+        // Transfer NFT to the buyer.
+        nftContract.safeTransferFrom(
+            nftListings[_tokenId].owner.addr,
+            msg.sender,
+            _tokenId
+        );
+
+        // Remove NFT from listing
+        nftListings[_tokenId].isListed = false;
+
+        // Update the NFT owner.
+        nftListings[_tokenId].previousOwner = ownerBeforeSale;
+        nftListings[_tokenId].owner.addr = payable(msg.sender);
+
+        // Emit the NFT_Sold event.
+        emit NFT_Sold(
+            nftListings[_tokenId].seller,
+            msg.sender,
+            _tokenId,
+            nftPrice
+        );
+    }
+
+    function makeTokenPayments(
+        uint256 _tokenId,
+        uint256 _nftPrice
+    ) private nonReentrant {
+        // Calculate royalties and platform fees.
+        uint256 platformFees = (25 * _nftPrice) / 1000; // 2.5%
+
+        // Royalties for previous owner.
         uint256 royalties = (
-            nftListings[_tokenId].previousOwner.royaltyPercentage * nftPrice
+            nftListings[_tokenId].previousOwner.royaltyPercentage * _nftPrice
         ) / 100;
         
         // NFT sell price after reductions.
-        uint256 updatedPrice = nftPrice - platformFees - royalties;
+        uint256 updatedPrice = _nftPrice - platformFees - royalties;
 
         // Transfer updated sell price to current NFT owner.
         tokenContract.safeTransferFrom(
@@ -161,7 +159,10 @@ contract MarketPlace is Ownable, ReentrancyGuard {
         );
 
         // Transfer royalties to previous NFT owner.
-        if (nftListings[_tokenId].previousOwner.addr != address(0)) {
+        if (
+            nftListings[_tokenId].previousOwner.addr != address(0) &&
+            royalties > 0
+        ) {
             tokenContract.safeTransferFrom(
                 msg.sender,
                 nftListings[_tokenId].previousOwner.addr,
@@ -175,24 +176,48 @@ contract MarketPlace is Ownable, ReentrancyGuard {
             address(this),
             platformFees
         );
+    }
 
-        // Transfer NFT to the buyer.
-        nftContract.safeTransferFrom(
-            nftListings[_tokenId].owner.addr,
-            msg.sender,
-            _tokenId
+    function preListingValidation (
+        uint256 _tokenId,
+        uint256 _price,
+        uint256 _royaltyPercentage
+    ) private view {
+        require(
+            nftContract.ownerOf(_tokenId) == msg.sender ||
+            nftContract.getApproved(_tokenId) == msg.sender,
+            "Marketplace: You are not authorized to list this NFT."
         );
-
-        // Remove NFT from listing
-        nftListings[_tokenId].isListed = false;
-
-        // Emit the NFT_Sold event.
-        emit NFT_Sold(
-            nftListings[_tokenId].seller,
-            msg.sender,
-            _tokenId,
-            nftPrice
+        require(
+            nftListings[_tokenId].isListed == false,
+            "Marketplace: NFT is already listed for sale."
+        );
+        require(
+            _price > 0,
+            "Marketplace: NFT price must be greater than 0."
+        );
+        require(
+            _royaltyPercentage >= 0 &&
+            _royaltyPercentage < 31,
+            "Marketplace: Royalty Percentage must be between 0 and 30%."
         );
     }
 
+    function preSaleValidation(
+        uint256 _tokenId
+    ) private view {
+        require(
+            nftListings[_tokenId].isListed == true,
+            "Marketplace: NFT with given id is not available for sale."
+        );
+        require(
+            nftListings[_tokenId].owner.addr != msg.sender &&
+            nftListings[_tokenId].seller != msg.sender,
+            "Marketplace: Cannot buy your own NFT."
+        );
+        require(
+            tokenContract.allowance(msg.sender, address(this)) >= nftListings[_tokenId].price,
+            "Marketplace: Unsufficient token allowance."
+        );
+    }
 }
